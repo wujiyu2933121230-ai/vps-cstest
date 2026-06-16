@@ -65,9 +65,9 @@ hy2_check_port_hopping() {
 hy2_get_port_hopping_info() {
     if [[ -f "$HY2_PORT_HOP_CONF" ]]; then
         local sp ep tp
-        sp=$(grep -oP '^START_PORT=\K.*' "$HY2_PORT_HOP_CONF" 2>/dev/null)
-        ep=$(grep -oP '^END_PORT=\K.*' "$HY2_PORT_HOP_CONF" 2>/dev/null)
-        tp=$(grep -oP '^TARGET_PORT=\K.*' "$HY2_PORT_HOP_CONF" 2>/dev/null)
+        sp=$(grep '^START_PORT=' "$HY2_PORT_HOP_CONF" 2>/dev/null | cut -d'=' -f2)
+        ep=$(grep '^END_PORT=' "$HY2_PORT_HOP_CONF" 2>/dev/null | cut -d'=' -f2)
+        tp=$(grep '^TARGET_PORT=' "$HY2_PORT_HOP_CONF" 2>/dev/null | cut -d'=' -f2)
         echo "${sp:-?}-${ep:-?} -> ${tp:-?}"
     else
         echo "未配置"
@@ -109,6 +109,11 @@ hy2_add_port_hopping() {
     start_port=${1:-$HY2_START_PORT}
     end_port=${2:-$HY2_END_PORT}
     target_port=${3:-$(hy2_get_listen_port)}
+
+    if iptables -t nat -C PREROUTING -i "$iface" -p udp --dport "$start_port:$end_port" -j REDIRECT --to-ports "$target_port" 2>/dev/null; then
+        log_warn "端口跳跃规则已存在"
+        return 0
+    fi
 
     if iptables -t nat -A PREROUTING -i "$iface" -p udp --dport "$start_port:$end_port" -j REDIRECT --to-ports "$target_port" 2>&1; then
         cat > "$HY2_PORT_HOP_CONF" << EOF
@@ -155,9 +160,9 @@ ExecStop=/bin/bash -c '
 [Install]
 WantedBy=multi-user.target
 UNITEOF
-    systemctl daemon-reload
-    systemctl enable hysteria-port-hopping.service >/dev/null 2>&1
-    systemctl start hysteria-port-hopping.service >/dev/null 2>&1
+    systemctl daemon-reload || true
+    systemctl enable hysteria-port-hopping.service >/dev/null 2>&1 || true
+    systemctl start hysteria-port-hopping.service >/dev/null 2>&1 || true
     log_ok "端口跳跃规则已持久化"
 }
 
@@ -214,7 +219,7 @@ hy2_install() {
             press_enter
             return
         fi
-        [[ -f "$HY2_CONFIG" ]] && cp "$HY2_CONFIG" "${HY2_CONFIG}.bak.$(date +%Y%m%d_%H%M%S)"
+        [[ -f "$HY2_CONFIG" ]] && cp "$HY2_CONFIG" "${HY2_CONFIG}.bak.$(date +%Y%m%d_%H%M%S)_${RANDOM}"
     fi
 
     echo "正在安装 Hysteria2..."
@@ -259,7 +264,7 @@ hy2_quick_config() {
             press_enter
             return
         fi
-        cp "$HY2_CONFIG" "${HY2_CONFIG}.bak.$(date +%Y%m%d_%H%M%S)"
+        cp "$HY2_CONFIG" "${HY2_CONFIG}.bak.$(date +%Y%m%d_%H%M%S)_${RANDOM}"
     fi
 
     echo -e "${BLUE}[1/6] 获取服务器信息...${NC}"
@@ -284,7 +289,7 @@ hy2_quick_config() {
     mkdir -p /etc/hysteria
     if ! openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
         -keyout "$HY2_KEY" -out "$HY2_CERT" \
-        -subj "/CN=$best_domain" -days 3650; then
+        -subj "/CN=$best_domain" -days 3650 >/dev/null 2>&1; then
         log_error "证书生成失败，请检查 openssl 版本"
         press_enter
         return
@@ -320,8 +325,16 @@ EOF
     chmod 600 "$HY2_CONFIG"
     echo "  配置生成完成"
 
+    echo -e "${BLUE}[5.5/6] 验证配置文件...${NC}"
+    if ! "$HY2_BIN" check -c "$HY2_CONFIG" >/dev/null 2>&1; then
+        log_error "配置文件验证失败"
+        press_enter
+        return
+    fi
+    log_ok "配置文件验证通过"
+
     echo -e "${BLUE}[6/6] 配置端口跳跃并启动服务...${NC}"
-    hy2_add_port_hopping "$HY2_START_PORT" "$HY2_END_PORT" "443"
+    hy2_add_port_hopping "$HY2_START_PORT" "$HY2_END_PORT" "443" || true
 
     cat > "/etc/systemd/system/$HY2_SERVICE" << EOF
 [Unit]
@@ -343,12 +356,32 @@ EOF
     systemctl daemon-reload
     systemctl enable "$HY2_SERVICE" >/dev/null 2>&1
     systemctl restart "$HY2_SERVICE" 2>/dev/null
-    sleep 2
 
-    if systemctl is-active --quiet "$HY2_SERVICE"; then
+    local retries=10
+    while [[ $retries -gt 0 ]]; do
+        if systemctl is-active --quiet "$HY2_SERVICE" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        retries=$((retries - 1))
+    done
+
+    if systemctl is-active --quiet "$HY2_SERVICE" 2>/dev/null; then
         log_ok "服务启动成功"
     else
         log_error "服务启动失败，请检查: journalctl -u $HY2_SERVICE"
+    fi
+
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo ""
+        log_warn "检测到 UFW 防火墙已启用，请确保以下端口已开放:"
+        echo "  - TCP/UDP 443"
+        echo "  - UDP ${HY2_START_PORT}:${HY2_END_PORT}"
+        echo ""
+        echo "可使用以下命令:"
+        echo "  ufw allow 443/tcp"
+        echo "  ufw allow 443/udp"
+        echo "  ufw allow ${HY2_START_PORT}:${HY2_END_PORT}/udp"
     fi
 
     echo ""
@@ -590,7 +623,8 @@ hy2_uninstall() {
 
     systemctl stop "$HY2_SERVICE" 2>/dev/null
     systemctl disable "$HY2_SERVICE" 2>/dev/null
-    hy2_clear_port_hopping 2>/dev/null
+    hy2_clear_port_hopping 2>/dev/null || true
+    rm -f /etc/systemd/system/hysteria-port-hopping.service
     rm -rf /etc/hysteria
     rm -f "$HY2_BIN"
     rm -f /etc/systemd/system/hysteria-server.service
